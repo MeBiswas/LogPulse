@@ -1,65 +1,137 @@
 # src/generator/generate_logs.py
+
 import uuid
 import random
-
 from faker import Faker
+from pyspark.sql.types import *
 from pyspark.sql import SparkSession
 from datetime import datetime, timedelta
-from pyspark.sql.functions import udf, expr
-from pyspark.sql.types import StringType, TimeStampType
 
+# -----------------------------------
 # Initialization
+# -----------------------------------
 fake = Faker()
 spark = SparkSession.builder.appName("LogPulseDataGen").getOrCreate()
 
-NUM_ROWS = 100,000
+NUM_SESSIONS = 20000
 
-# 1. Create a Base DataFrame with IDs
-df = spark.range(0, NUM_ROWS)
-
-# 2. Logic for Custom Fields UDFs
-def get_uuid():
-    return str(uuid.uuid4())
-
-def get_city():
-    return fake.city()
-
-def get_timestamp():
-    start_time = datetime.now() - timedelta(days=30)
-    random_seconds = random.randint(0, 30*24*3600)
-    
-    return start_time + timedelta(seconds=random.randint(0, 30*24*3600))
-
-# Register UDFs
-uuid_udf = udf(get_uuid, StringType())
-city_udf = udf(get_city, StringType())
-timestamp_udf = udf(get_timestamp, TimeStampType())
-
-# 3. Columns Data
-device = ['mobile', 'desktop', 'tablet']
+# -----------------------------------
+# Static Data
+# -----------------------------------
+devices = ['mobile', 'desktop', 'tablet']
+countries = ['IN', 'US', 'UK', 'DE', 'FR']
 pages = ['/home', '/product', '/cart', '/checkout', '/search']
-event_types = ['page_view', 'click', 'add_to_cart', 'purchase', 'logout']
+referrers = ['google', 'facebook', 'direct', 'instagram', 'email']
+event_flow = ['page_view', 'click', 'add_to_cart', 'purchase', 'logout']
 
-df_final = df.withColumn("session_id", uuid_udf()) \
-    .withColumn("timestamp", timestamp_udf()) \
-    .withColumn("user_id", (expr("rand() * 9000 + 1000")).cast("int")) \
-    .withColumn("event_type", expr(f"element_at(array{tuple(event_types)}, cast(rand() * 5 + 1 as int))")) \
-    .withColumn("page_url", expr(f"element_at(array{tuple(pages)}, cast(rand() * 5 + 1 as int))")) \
-    .withColumn("location", city_udf())
+event_type_map = {e: i + 1 for i, e in enumerate(event_flow)}
 
-df_final.write.mode('overwrite').parquet('logpulse_data.parquet')
+# -----------------------------------
+# Session Generator
+# -----------------------------------
+def generate_session():
+    session_id = str(uuid.uuid4())
+    user_id = random.randint(1000, 9999)
+    device = random.choice(devices)
+    device_id = str(uuid.uuid4())
+    country = random.choice(countries)
+    country_id = countries.index(country) + 1
+    ref = random.choice(referrers)
 
-print("Distributed dataset generated successfully!")
+    # Keep product consistent in session
+    product_id = random.randint(10000, 10100)
 
-# for _ in range(NUM_ROWS):
-#     event = random.choice(event_types)
+    # Heavy vs casual users
+    is_heavy = random.random() < 0.2
+    num_events = random.randint(5, 10) if is_heavy else random.randint(2, 5)
 
-#     row = {
-#         'event_ts': event,
-#         'device_id': random.choice(device),
-#         'event_type_id': event_types[event],
-#         'country': fake.country(),
-#         'duration_sec': random.randint(1, 300),
-#         'referrer': fake.url(),
-#         "product_id": random.randint(100, 500) if event in ["add_to_cart", "purchase"] else None
-#     }
+    # Peak hour bias (evening heavy traffic)
+    base_time = datetime.now() - timedelta(days=random.randint(0, 30))
+    hour = random.choices(
+        population=list(range(24)),
+        weights=[1]*8 + [2]*6 + [5]*6 + [2]*4
+    )[0]
+
+    base_time = base_time.replace(
+        hour=hour,
+        minute=random.randint(0, 59),
+        second=random.randint(0, 59),
+        microsecond=0
+    )
+
+    events = []
+    current_time = base_time
+
+    for i in range(num_events):
+        # Funnel drop-off
+        if i > 0 and random.random() < 0.2:
+            break
+
+        # Stop after funnel ends
+        if i >= len(event_flow):
+            break
+
+        event_type = event_flow[i]
+
+        # Time gap between events
+        gap = random.randint(5, 120)
+        current_time += timedelta(seconds=gap)
+
+        duration = random.randint(5, 300)
+
+        events.append((
+            str(uuid.uuid4()),   # event_id
+            session_id,
+            user_id,
+            device,
+            device_id,
+            event_type,
+            event_type_map[event_type],
+            random.choice(pages),
+            country,
+            country_id,
+            ref,
+            product_id,
+            duration,
+            current_time
+        ))
+
+    return events
+
+
+# -----------------------------------
+# Generate Data
+# -----------------------------------
+all_data = []
+
+for _ in range(NUM_SESSIONS):
+    all_data.extend(generate_session())
+
+# -----------------------------------
+# Schema
+# -----------------------------------
+schema = StructType([
+    StructField("event_id", StringType()),
+    StructField("session_id", StringType()),
+    StructField("user_id", IntegerType()),
+    StructField("device", StringType()),
+    StructField("device_id", StringType()),
+    StructField("event_type", StringType()),
+    StructField("event_type_id", IntegerType()),
+    StructField("page_url", StringType()),
+    StructField("country", StringType()),
+    StructField("country_id", IntegerType()),
+    StructField("referrer", StringType()),
+    StructField("product_id", IntegerType()),
+    StructField("duration_sec", IntegerType()),
+    StructField("event_ts", TimestampType())
+])
+
+# -----------------------------------
+# Create DataFrame & Save
+# -----------------------------------
+df = spark.createDataFrame(all_data, schema)
+
+df.write.mode("overwrite").parquet("data/raw/logpulse_data.parquet")
+
+print(f"✅ Generated {df.count()} events across {NUM_SESSIONS} sessions")
